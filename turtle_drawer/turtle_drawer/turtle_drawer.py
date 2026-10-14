@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-turtle_drawer —— 让小海龟画出指定数字
+turtle_drawer —— 让小海龟画出指定数字（一笔画曲线最终版）
 ================================================
 任务：让小海龟在画布上画出自己学号的最后两位数字
 日志格式：[INFO] [TurtleDrawer]: Drawing digit 7, step 1...
-
-用法：
-    ros2 run turtle_drawer turtle_drawer          # 默认画 07
-    ros2 run turtle_drawer turtle_drawer 25       # 画 25
 """
 
 import math
@@ -25,9 +21,8 @@ from turtlesim.srv import TeleportAbsolute, SetPen
 # 数字笔画定义（局部坐标）
 # 网格：x 从 0(左) 到 3(右)，y 从 0(下) 到 4(上)
 # 数据格式：{数字: [ [笔尖移动序列], ... ]}
-#   每个笔尖移动序列 = [(x, y, 是否落笔), ...]
-#   pen_down=False 表示"抬笔跳到这个点"，不会留线
-#   pen_down=True  表示"从上一个点画线到这个点"
+#   直线段： (x, y, 是否落笔)
+#   曲线段： {'center': (x, y), 'radius': R, 'sweep': 弧度, 'start_angle': 起始角}
 # ==========================================================
 DIGITS = {
     '0': [[(0, 0, False), (3, 0, True), (3, 4, True), (0, 4, True), (0, 0, True)]],
@@ -42,8 +37,11 @@ DIGITS = {
     '6': [[(3, 4, False), (0, 4, True), (0, 0, True), (3, 0, True), (3, 2, True), (0, 2, True)]],
     '7': [[(0, 4, False), (3, 4, True)],
           [(3, 4, False), (1.0, 0, True)]],
-    '8': [[(0, 0, False), (3, 0, True), (3, 4, True), (0, 4, True), (0, 0, True)],
-          [(0, 2, False), (3, 2, True)]],
+    # ⭐ 核心优化：上下两圆在腰部相切，起点/终点都在腰部，方向均为向左
+    '8': [[
+        {'center': (1.5, 2.9), 'radius': 0.9, 'sweep': -2 * math.pi, 'start_angle': -math.pi / 2},
+        {'center': (1.5, 1.0), 'radius': 1.0, 'sweep': 2 * math.pi, 'start_angle': math.pi / 2}
+    ]],
     '9': [[(3, 2, False), (3, 4, True), (0, 4, True), (0, 2, True), (3, 2, True)],
           [(3, 2, False), (3, 0, True), (0.5, 0, True)]],
 }
@@ -58,7 +56,7 @@ DIGIT_COLORS = {
     '5': (60, 140, 255),
     '6': (170, 90, 255),
     '7': (255, 90, 200),
-    '8': (255, 255, 255),
+    '8': (255, 200, 60),
     '9': (160, 255, 160),
 }
 
@@ -156,6 +154,54 @@ class TurtleDrawer(Node):
         self.stop()
         time.sleep(0.08)
 
+    # ⭐ 核心升级：新增 is_continuous 参数，支持不抬笔连续画弧
+    def arc(self, cx, cy, radius, total_sweep, start_angle=0.0, is_continuous=False, label='', r=255, g=200, b=60):
+        """让海龟沿圆弧行走（支持自定义起点和方向，支持一笔连续画）"""
+        # 根据起始角度计算起点坐标
+        start_x = cx + radius * math.cos(start_angle)
+        start_y = cy + radius * math.sin(start_angle)
+
+        # 根据顺/逆时针方向计算初始朝向（切线方向）
+        if total_sweep > 0:      # 逆时针
+            theta = start_angle + math.pi / 2.0
+            omega = LINEAR_SPEED / radius
+        else:                    # 顺时针
+            theta = start_angle - math.pi / 2.0
+            omega = -LINEAR_SPEED / radius
+
+        if not is_continuous:
+            # 抬笔 -> 瞬移到起点 -> 落笔
+            self.set_pen(r, g, b, width=3, off=1)
+            self.teleport(start_x, start_y, theta)
+            self.set_pen(r, g, b, width=3, off=0)
+        else:
+            # 连续绘制时，海龟已经在起点且朝向正确，只需更新内部坐标状态
+            self.cur_x = start_x
+            self.cur_y = start_y
+            self.cur_theta = theta
+
+        v = LINEAR_SPEED
+        # 按固定周期计算需要走多少步
+        ticks = max(1, int(round(abs(total_sweep) / abs(omega) / TICK)))
+
+        self.get_logger().info(
+            f'  {label}: 走圆弧 圆心=({cx:.2f}, {cy:.2f}) 半径={radius:.2f} '
+            f'扫过={math.degrees(total_sweep):.1f}° 方向={"逆时针" if total_sweep > 0 else "顺时针"} '
+            f'({ticks} 个控制周期)')
+
+        twist = Twist()
+        twist.linear.x = v
+        twist.angular.z = omega
+
+        for _ in range(ticks):
+            self.pub.publish(twist)
+            self.cur_theta += omega * TICK
+            self.cur_x += v * math.cos(self.cur_theta) * TICK
+            self.cur_y += v * math.sin(self.cur_theta) * TICK
+            time.sleep(TICK)
+
+        self.stop()
+
     def to_canvas(self, lx, ly, offset_x):
         """把局部坐标 (0..3, 0..4) 映射到画布坐标"""
         return (offset_x + lx, BOTTOM + ly)
@@ -167,39 +213,69 @@ class TurtleDrawer(Node):
 
         for stroke_idx, stroke in enumerate(strokes, start=1):
             step_counter += 1
-            n_points = len([p for p in stroke if p[2]])
+            has_curve = any(isinstance(s, dict) for s in stroke)
 
-            self.get_logger().info(
-                f'Drawing digit {ch}, step {step_counter}... '
-                f'(笔画 {stroke_idx} / {len(strokes)}, '
-                f'{n_points} 个画线段)')
-
-            # 1) 抬笔 → 瞬移到本笔起点
-            self.set_pen(r, g, b, width=3, off=1)
-            sx, sy = self.to_canvas(stroke[0][0], stroke[0][1], offset_x)
-            if len(stroke) > 1:
-                nx, ny = self.to_canvas(stroke[1][0], stroke[1][1], offset_x)
-                theta = math.atan2(ny - sy, nx - sx)
-            else:
-                theta = 0.0
-            self.teleport(sx, sy, theta)
-
-            # 2) 落笔
-            self.set_pen(r, g, b, width=3, off=0)
-
-            # 3) 依次走完本笔的所有画线段
-            seg_no = 0
-            for (lx, ly, pen_down) in stroke:
-                if not pen_down:
-                    continue
-                seg_no += 1
-                tx, ty = self.to_canvas(lx, ly, offset_x)
+            if has_curve:
+                n_points = len([s for s in stroke if not isinstance(s, dict)])
                 self.get_logger().info(
-                    f'  digit {ch} step {step_counter}: '
-                    f'segment {seg_no}/{n_points} → ({tx:.2f}, {ty:.2f})')
-                self.go_to(tx, ty, label=f'digit {ch} step {step_counter}')
+                    f'Drawing digit {ch}, step {step_counter}... '
+                    f'(笔画 {stroke_idx} / {len(strokes)}, {n_points} 个画线段)')
+            else:
+                n_points = len([p for p in stroke if p[2]])
+                self.get_logger().info(
+                    f'Drawing digit {ch}, step {step_counter}... '
+                    f'(笔画 {stroke_idx} / {len(strokes)}, {n_points} 个画线段)')
 
-            # 4) 抬笔
+            # 记录当前笔画是否已经开始绘制（用于判断曲线是否连续）
+            stroke_started = False
+
+            # 如果是纯直线，先抬笔瞬移到起点
+            if not has_curve:
+                self.set_pen(r, g, b, width=3, off=1)
+                sx, sy = self.to_canvas(stroke[0][0], stroke[0][1], offset_x)
+                if len(stroke) > 1:
+                    nx, ny = self.to_canvas(stroke[1][0], stroke[1][1], offset_x)
+                    theta = math.atan2(ny - sy, nx - sx)
+                else:
+                    theta = 0.0
+                self.teleport(sx, sy, theta)
+                self.set_pen(r, g, b, width=3, off=0)
+                stroke_started = True
+
+            # 依次走完本笔的所有线段或曲线
+            seg_no = 0
+            for seg in stroke:
+                if isinstance(seg, dict):
+                    # 曲线段
+                    cx, cy = self.to_canvas(seg['center'][0], seg['center'][1], offset_x)
+                    radius = seg['radius'] * (DIGIT_W / 3.0)
+                    sweep = seg['sweep']
+                    start_angle = seg.get('start_angle', 0.0)
+
+                    self.get_logger().info(
+                        f'  digit {ch} step {step_counter}: '
+                        f'curve → 圆心({cx:.2f}, {cy:.2f}) 半径 {radius:.2f}')
+
+                    # 关键：如果本笔画已经开始了（即有前一段曲线），则连续绘制，不抬笔
+                    is_cont = stroke_started
+
+                    self.arc(cx, cy, radius, sweep, start_angle, is_continuous=is_cont,
+                             label=f'digit {ch} step {step_counter}', r=r, g=g, b=b)
+                    stroke_started = True
+                else:
+                    # 直线段
+                    lx, ly, pen_down = seg
+                    if not pen_down:
+                        continue
+                    seg_no += 1
+                    tx, ty = self.to_canvas(lx, ly, offset_x)
+                    self.get_logger().info(
+                        f'  digit {ch} step {step_counter}: '
+                        f'segment {seg_no}/{n_points} → ({tx:.2f}, {ty:.2f})')
+                    self.go_to(tx, ty, label=f'digit {ch} step {step_counter}')
+                    stroke_started = True
+
+            # 抬笔（off=1）
             self.set_pen(r, g, b, width=3, off=1)
 
         return step_counter
